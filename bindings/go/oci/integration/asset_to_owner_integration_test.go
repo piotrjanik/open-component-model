@@ -69,7 +69,6 @@ func Test_Integration_AssetToOwner(t *testing.T) {
 	repo, err := oci.NewRepository(
 		oci.WithResolver(resolver),
 		oci.WithTempDir(t.TempDir()),
-		oci.WithOwnershipReferrerPolicy(oci.OwnershipReferrerPolicyEnabled),
 	)
 	r.NoError(err)
 
@@ -155,33 +154,34 @@ func Test_Integration_AssetToOwner(t *testing.T) {
 			"identical re-uploads must converge on a single referrer; got %d distinct manifests", len(referrers))
 	})
 
-	t.Run("policy disabled: resource uploads without an ownership referrer", func(t *testing.T) {
-		// Locks in the opt-out contract: a repository constructed without
-		// [oci.WithOwnershipReferrerPolicy] (the default
-		// [oci.OwnershipReferrerPolicyDisabled]) must accept a by-value
-		// resource and leave the Referrers API empty for that subject.
-		r := require.New(t)
-		disabledRepo, err := oci.NewRepository(
-			oci.WithResolver(resolver),
-			oci.WithTempDir(t.TempDir()),
-		)
-		r.NoError(err)
-
+	t.Run("external relation: resource uploads without an ownership referrer", func(t *testing.T) {
+		// Locks in the opt-out contract: a referrer is created only for resources
+		// owned by the component (local relation). An external resource must be
+		// accepted by value and leave the Referrers API empty for that subject.
 		const (
-			disabledComponent = "ocm.software/asset-to-owner-test-disabled"
-			disabledResource  = "backend-image-disabled"
+			externalComponent = "ocm.software/asset-to-owner-test-external"
+			externalResource  = "backend-image-external"
 		)
-		resourceDigest := uploadResource(t, ctx, disabledRepo, disabledComponent, componentVersion, disabledResource, []byte("ownership-payload-disabled"))
+		resourceDigest := uploadResourceWithRelation(t, ctx, repo, externalComponent, componentVersion, externalResource, []byte("ownership-payload-external"), descriptor.ExternalRelation)
 
-		referrers := listOwnershipReferrers(t, ctx, resolver, disabledComponent, componentVersion, resourceDigest)
+		referrers := listOwnershipReferrers(t, ctx, resolver, externalComponent, componentVersion, resourceDigest)
 		assert.Emptyf(t, referrers,
-			"policy disabled must not push any ownership referrer; found %d", len(referrers))
+			"external relation must not push any ownership referrer; found %d", len(referrers))
 	})
 }
 
-// uploadResource pushes a one-layer OCI image as a local resource through repo
-// and returns the digest of the resulting subject manifest.
+// uploadResource pushes a one-layer OCI image as a local resource (local
+// relation) through repo and returns the digest of the resulting subject
+// manifest.
 func uploadResource(t *testing.T, ctx context.Context, repo *oci.Repository, component, version, name string, payload []byte) digest.Digest {
+	t.Helper()
+	return uploadResourceWithRelation(t, ctx, repo, component, version, name, payload, descriptor.LocalRelation)
+}
+
+// uploadResourceWithRelation pushes a one-layer OCI image as a local resource
+// with the given relation through repo and returns the digest of the resulting
+// subject manifest.
+func uploadResourceWithRelation(t *testing.T, ctx context.Context, repo *oci.Repository, component, version, name string, payload []byte, relation descriptor.ResourceRelation) digest.Digest {
 	t.Helper()
 	r := require.New(t)
 	data, _ := createSingleLayerOCIImage(t, payload)
@@ -190,7 +190,7 @@ func uploadResource(t *testing.T, ctx context.Context, repo *oci.Repository, com
 			ObjectMeta: descriptor.ObjectMeta{Name: name, Version: version},
 		},
 		Type:     "ociArtifact",
-		Relation: descriptor.LocalRelation,
+		Relation: relation,
 		Access: &v2.LocalBlob{
 			Type: ocmruntime.Type{
 				Name:    v2.LocalBlobAccessType,
@@ -222,4 +222,143 @@ func listOwnershipReferrers(t *testing.T, ctx context.Context, resolver *urlreso
 	refs, err := orasregistry.Referrers(ctx, graphStore, subject, annotations.OwnershipArtifactType)
 	r.NoError(err)
 	return refs
+}
+
+// Test_Integration_TransferOwnershipReferrer verifies the transfer half of
+// ADR 0016 end-to-end: an ownership referrer attached to a by-value resource on
+// a source registry is present on the target registry after transfer.
+//
+// The flow mirrors `ocm transfer` of an OCI artifact stored by value:
+// GetLocalResource pulls the resource (and, via the live Referrers API, its
+// ownership referrer) into an OCI layout, then AddLocalResource on the target
+// copies that layout — referrer included — into the target repository.
+//
+// Two registries are used so both sides can carry the SAME component name, as
+// `ocm transfer` does (it preserves the component name; only the repository
+// changes).
+func Test_Integration_TransferOwnershipReferrer(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+	r := require.New(t)
+
+	const (
+		component    = "ocm.software/transfer-ownership-test"
+		version      = "v1.0.0"
+		resourceName = "backend-image"
+	)
+
+	// The resource has local relation, so both source and target create an
+	// ownership referrer on upload, and the source's referrer also travels in the
+	// transferred layout and is copied across. All three converge on the same
+	// digest, so the target ends up with exactly one referrer.
+	srcResolver := launchOwnershipRegistry(t, ctx)
+	dstResolver := launchOwnershipRegistry(t, ctx)
+
+	srcRepo, err := oci.NewRepository(
+		oci.WithResolver(srcResolver),
+		oci.WithTempDir(t.TempDir()),
+	)
+	r.NoError(err)
+
+	dstRepo, err := oci.NewRepository(
+		oci.WithResolver(dstResolver),
+		oci.WithTempDir(t.TempDir()),
+	)
+	r.NoError(err)
+
+	// 1. Author the resource on the source. Because the resource has local
+	//    relation the upload also pushes one ownership referrer, and a component
+	//    version is added so the resource is resolvable via GetLocalResource.
+	data, _ := createSingleLayerOCIImage(t, []byte("transfer-payload"))
+	resource := &descriptor.Resource{
+		Relation:    descriptor.LocalRelation,
+		ElementMeta: descriptor.ElementMeta{ObjectMeta: descriptor.ObjectMeta{Name: resourceName, Version: version}},
+		Type:        "ociArtifact",
+		Access: &v2.LocalBlob{
+			Type:           ocmruntime.Type{Name: v2.LocalBlobAccessType, Version: v2.LocalBlobAccessTypeVersion},
+			MediaType:      layout.MediaTypeOCIImageLayoutTarGzipV1,
+			LocalReference: digest.FromBytes(data).String(),
+		},
+	}
+	srcRes, err := srcRepo.AddLocalResource(ctx, component, version, resource, inmemory.New(bytes.NewReader(data)))
+	r.NoError(err)
+
+	srcDesc := &descriptor.Descriptor{
+		Meta: descriptor.Meta{Version: "v2"},
+		Component: descriptor.Component{
+			Provider:      descriptor.Provider{Name: "ocm.software"},
+			ComponentMeta: descriptor.ComponentMeta{ObjectMeta: descriptor.ObjectMeta{Name: component, Version: version}},
+			Resources:     []descriptor.Resource{*srcRes},
+		},
+	}
+	r.NoError(srcRepo.AddComponentVersion(ctx, srcDesc))
+
+	// Sanity: the source must carry exactly the created ownership referrer.
+	var srcAccess v2.LocalBlob
+	r.NoError(v2.Scheme.Convert(srcRes.Access, &srcAccess))
+	srcReferrers := listOwnershipReferrers(t, ctx, srcResolver, component, version, digest.Digest(srcAccess.LocalReference))
+	r.Len(srcReferrers, 1, "the source must carry the created ownership referrer")
+
+	// 2. Transfer: GetLocalResource pulls the resource and its ownership referrer
+	//    into a layout; AddLocalResource on the target copies it across.
+	blobContent, transferRes, err := srcRepo.GetLocalResource(ctx, component, version, ocmruntime.Identity{
+		"name":    resourceName,
+		"version": version,
+	})
+	r.NoError(err)
+
+	// GetLocalResource re-materializes the layout, so its bytes — and thus the
+	// local-blob digest — differ from the source's; clear the carried digest so
+	// the target adopts the re-packed blob's digest. This is orthogonal to the
+	// referrer copy under test (which is independent of the layout digest).
+	transferRes.Digest = nil
+
+	dstRes, err := dstRepo.AddLocalResource(ctx, component, version, transferRes, blobContent)
+	r.NoError(err)
+
+	// 3. The ownership referrer must be discoverable on the TARGET via the live
+	//    Referrers API — and there must be exactly one despite creation and the
+	//    copy both running, because they converge on the same digest.
+	var dstAccess v2.LocalBlob
+	r.NoError(v2.Scheme.Convert(dstRes.Access, &dstAccess))
+	dstReferrers := listOwnershipReferrers(t, ctx, dstResolver, component, version, digest.Digest(dstAccess.LocalReference))
+	r.Len(dstReferrers, 1, "the ownership referrer must be copied to the target registry")
+
+	assert.Equal(t, component, dstReferrers[0].Annotations[annotations.OwnershipComponentName],
+		"the copied referrer must retain its component name")
+	assert.Equal(t, version, dstReferrers[0].Annotations[annotations.OwnershipComponentVersion],
+		"the copied referrer must retain its component version")
+}
+
+// launchOwnershipRegistry starts an htpasswd-protected distribution registry and
+// returns a resolver pointing at it. The container is torn down on test cleanup.
+func launchOwnershipRegistry(t *testing.T, ctx context.Context) *urlresolver.CachingResolver {
+	t.Helper()
+	r := require.New(t)
+
+	password := generateRandomPassword(t, passwordLength)
+	htpasswd := generateHtpasswd(t, testUsername, password)
+
+	registryContainer, err := registry.Run(ctx, distributionRegistryImage,
+		registry.WithHtpasswd(htpasswd),
+		testcontainers.WithEnv(map[string]string{
+			"REGISTRY_VALIDATION_DISABLED": "true",
+		}),
+		testcontainers.WithLogger(log.TestLogger(t)),
+	)
+	r.NoError(err)
+	t.Cleanup(func() {
+		r.NoError(testcontainers.TerminateContainer(registryContainer))
+	})
+
+	address, err := registryContainer.HostAddress(ctx)
+	r.NoError(err)
+
+	resolver, err := urlresolver.New(
+		urlresolver.WithBaseURL(address),
+		urlresolver.WithPlainHTTP(true),
+		urlresolver.WithBaseClient(createAuthClient(address, testUsername, password)),
+	)
+	r.NoError(err)
+	return resolver
 }

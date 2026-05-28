@@ -114,6 +114,37 @@ type ResourceRepository interface {
 	DownloadResource(ctx context.Context, res *descriptor.Resource, credentials runtime.Typed) (blob.ReadOnlyBlob, error)
 }
 
+// OwnershipReferrer records that an artifact is owned by a component version, as
+// discovered from an asset-to-owner ownership referrer (ADR 0016).
+type OwnershipReferrer struct {
+	// Component is the owning component name (from software.ocm.component.name).
+	Component string
+	// Version is the owning component version (from software.ocm.component.version).
+	Version string
+	// Artifact is the identity of the owned artifact within the component version
+	// (the identity carried in software.ocm.artifact).
+	Artifact runtime.Identity
+}
+
+// OwnershipReferrerRepository is an optional capability of a [ResourceRepository]:
+// attaching and reading asset-to-owner ownership referrers (ADR 0016) for resources
+// kept by reference. Only repositories backed by an OCI registry — which exposes a
+// Referrers API — implement it; callers type-assert a [ResourceRepository] for it
+// and treat its absence as "ownership referrers are not supported here".
+type OwnershipReferrerRepository interface {
+	// AddOwnershipReferrer attaches an ownership referrer linking res back to the
+	// owning component version in the registry that hosts it. It is used for
+	// relation=local resources kept by reference (their access is not copied by
+	// value), so the referenced artifact records which component version owns it.
+	// The credentials must carry the authentication needed to write to the registry.
+	AddOwnershipReferrer(ctx context.Context, component, version string, res *descriptor.Resource, credentials runtime.Typed) error
+	// GetOwnershipReferrer returns the ownership referrers attached to res — the
+	// component versions that claim ownership of the referenced artifact. It returns
+	// an empty slice when the artifact carries none. The credentials must carry the
+	// authentication needed to read from the registry.
+	GetOwnershipReferrer(ctx context.Context, res *descriptor.Resource, credentials runtime.Typed) ([]OwnershipReferrer, error)
+}
+
 // SourceRepository defines the interface for storing and retrieving OCM sources
 // independently of component versions from a store implementation.
 // TODO https://github.com/open-component-model/ocm-project/issues/857 also provide credentials in UploadSource/DownloadSource

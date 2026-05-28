@@ -49,6 +49,10 @@ type ResourceRepository struct {
 // make sure that ResourceRepository implements the oci ResourceRepository interface
 var _ repository.ResourceRepository = (*ResourceRepository)(nil)
 
+// The OCI resource repository is the only implementation of the optional
+// asset-to-owner ownership-referrer capability (ADR 0016).
+var _ repository.OwnershipReferrerRepository = (*ResourceRepository)(nil)
+
 func NewResourceRepository(filesystemConfig *filesystemv1alpha1.Config, opts ...Option) *ResourceRepository {
 	options := &Options{}
 	for _, opt := range opts {
@@ -144,6 +148,60 @@ func (p *ResourceRepository) DownloadResource(ctx context.Context, resource *des
 		return nil, fmt.Errorf("error downloading resource: %w", err)
 	}
 	return b, nil
+}
+
+// AddOwnershipReferrer attaches an asset-to-owner ownership referrer (ADR 0016)
+// to a by-reference OCI image resource, pushing the referrer into the registry
+// that hosts the image. It delegates to the inner repository's
+// [oci.Repository.AddOwnershipReferrer]. It implements
+// [repository.OwnershipReferrerRepository.AddOwnershipReferrer].
+func (p *ResourceRepository) AddOwnershipReferrer(ctx context.Context, component, version string, resource *descriptor.Resource, credentials runtime.Typed) error {
+	repo, err := p.resolveOCIImageRepo(resource, credentials)
+	if err != nil {
+		return err
+	}
+	resource, err = p.withTypedAccess(resource)
+	if err != nil {
+		return err
+	}
+	if err := repo.AddOwnershipReferrer(ctx, component, version, resource); err != nil {
+		return fmt.Errorf("error attaching ownership referrer: %w", err)
+	}
+	return nil
+}
+
+// GetOwnershipReferrer returns the asset-to-owner ownership referrers (ADR 0016)
+// attached to a by-reference OCI image resource, discovered via the registry's
+// Referrers API. It delegates to the inner repository's
+// [oci.Repository.GetOwnershipReferrer]. It implements
+// [repository.OwnershipReferrerRepository.GetOwnershipReferrer].
+func (p *ResourceRepository) GetOwnershipReferrer(ctx context.Context, resource *descriptor.Resource, credentials runtime.Typed) ([]repository.OwnershipReferrer, error) {
+	repo, err := p.resolveOCIImageRepo(resource, credentials)
+	if err != nil {
+		return nil, err
+	}
+	resource, err = p.withTypedAccess(resource)
+	if err != nil {
+		return nil, err
+	}
+	return repo.GetOwnershipReferrer(ctx, resource)
+}
+
+// withTypedAccess returns a copy of resource whose access is converted from
+// *runtime.Raw to the typed access spec, so the inner repository's type-switch
+// can match it.
+func (p *ResourceRepository) withTypedAccess(resource *descriptor.Resource) (*descriptor.Resource, error) {
+	resource = resource.DeepCopy()
+	t := resource.Access.GetType()
+	obj, err := p.GetResourceRepositoryScheme().NewObject(t)
+	if err != nil {
+		return nil, fmt.Errorf("error creating new object for type %s: %w", t, err)
+	}
+	if err := p.GetResourceRepositoryScheme().Convert(resource.Access, obj); err != nil {
+		return nil, fmt.Errorf("error converting access to object of type %s: %w", t, err)
+	}
+	resource.Access = obj
+	return resource, nil
 }
 
 func (p *ResourceRepository) UploadResource(ctx context.Context, resource *descriptor.Resource, content blob.ReadOnlyBlob, credentials runtime.Typed) (*descriptor.Resource, error) {

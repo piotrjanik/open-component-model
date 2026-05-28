@@ -31,3 +31,13 @@ type BuiltinResourceRepository interface {
 	Repository
 	GetResourceRepositoryScheme() *runtime.Scheme
 }
+
+// OwnershipReferrerAttacher is an optional capability of a [Repository]: an
+// implementation that can attach an asset-to-owner ownership referrer (ADR 0016)
+// links a by-reference resource back to the owning component version in the
+// registry that hosts it. It is intentionally kept out of [Repository] so that
+// out-of-process plugins (which cannot implement it) remain valid repositories;
+// callers type-assert for it and treat its absence as a no-op.
+type OwnershipReferrerAttacher interface {
+	AddOwnershipReferrer(ctx context.Context, component, version string, res *descriptor.Resource, credentials runtime.Typed) error
+}

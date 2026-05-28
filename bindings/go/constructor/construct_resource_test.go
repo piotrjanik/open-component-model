@@ -63,19 +63,26 @@ func (m *mockInputMethodProvider) GetResourceInputMethod(ctx context.Context, re
 	return nil, fmt.Errorf("no input method resolvable for input specification of type %s", resource.Input.GetType())
 }
 
-// mockResourceRepository implements ResourceRepository for testing
+// mockResourceRepository implements ResourceRepository for testing. It serves
+// downloads (downloadData/fail) and records how AddOwnershipReferrer was invoked
+// so the constructor's by-reference ownership attach chain can be asserted.
 type mockResourceRepository struct {
 	downloadData blob.ReadOnlyBlob
 	fail         bool
+
+	identityErr error // returned by GetResourceCredentialConsumerIdentity
+	attachErr   error // returned by AddOwnershipReferrer
+
+	attachCalls  int
+	gotComponent string
+	gotVersion   string
+	gotCreds     runtime.Typed
 }
 
 func (m *mockResourceRepository) GetResourceCredentialConsumerIdentity(ctx context.Context, resource *constructorruntime.Resource) (identity runtime.Identity, err error) {
-	identity = runtime.Identity{}
-	identity.SetType(runtime.NewVersionedType("mock", "v1"))
-	return identity, nil
-}
-
-func (m *mockResourceRepository) GetCredentialConsumerIdentity(ctx context.Context, resource *constructorruntime.Resource) (identity runtime.Identity, err error) {
+	if m.identityErr != nil {
+		return nil, m.identityErr
+	}
 	identity = runtime.Identity{}
 	identity.SetType(runtime.NewVersionedType("mock", "v1"))
 	return identity, nil
@@ -88,6 +95,14 @@ func (m *mockResourceRepository) DownloadResource(ctx context.Context, resource 
 	return m.downloadData, nil
 }
 
+func (m *mockResourceRepository) AddOwnershipReferrer(ctx context.Context, component, version string, res *descriptor.Resource, credentials runtime.Typed) error {
+	m.attachCalls++
+	m.gotComponent = component
+	m.gotVersion = version
+	m.gotCreds = credentials
+	return m.attachErr
+}
+
 // mockResourceRepositoryProvider implements ResourceRepositoryProvider for testing
 type mockResourceRepositoryProvider struct {
 	repo ResourceRepository
@@ -95,6 +110,17 @@ type mockResourceRepositoryProvider struct {
 
 func (m *mockResourceRepositoryProvider) GetResourceRepository(ctx context.Context, resource *constructorruntime.Resource) (ResourceRepository, error) {
 	return m.repo, nil
+}
+
+// mockResourceRepositoryProviderWithError returns its repo and a fixed error, so the
+// "could not resolve the resource repository" branch can be exercised.
+type mockResourceRepositoryProviderWithError struct {
+	repo ResourceRepository
+	err  error
+}
+
+func (m *mockResourceRepositoryProviderWithError) GetResourceRepository(ctx context.Context, resource *constructorruntime.Resource) (ResourceRepository, error) {
+	return m.repo, m.err
 }
 
 // mockAccess implements runtime.Typed for testing
@@ -896,4 +922,101 @@ func TestConstructCredentialsPassedAsDirectCredentials(t *testing.T) {
 	require.True(t, ok, "expected *credconfigv1.DirectCredentials, got %T", mockInput.capturedCreds)
 	assert.Equal(t, "testuser", dc.Properties["username"])
 	assert.Equal(t, "testpass", dc.Properties["password"])
+}
+
+func TestDefaultConstructor_attachOwnershipReferrer(t *testing.T) {
+	const (
+		component = "ocm.software/test-component"
+		version   = "v1.0.0"
+	)
+
+	resource := &constructorruntime.Resource{
+		ElementMeta: constructorruntime.ElementMeta{
+			ObjectMeta: constructorruntime.ObjectMeta{Name: "backend-image", Version: version},
+		},
+		Type:     "ociArtifact",
+		Relation: constructorruntime.LocalRelation,
+	}
+	res := &descriptor.Resource{
+		ElementMeta: descriptor.ElementMeta{ObjectMeta: descriptor.ObjectMeta{Name: "backend-image", Version: version}},
+		Relation:    descriptor.LocalRelation,
+	}
+
+	tests := []struct {
+		name string
+		// provider builds the opts.ResourceRepositoryProvider; nil means "not configured".
+		provider func(attacher *mockResourceRepository) ResourceRepositoryProvider
+		// attacher, when non-nil, is the capability-bearing repo whose calls are asserted.
+		attacher    *mockResourceRepository
+		wantErr     string
+		wantAttach  int
+		wantNilCred bool // assert the attacher was called with nil credentials
+	}{
+		{
+			name:       "no provider configured is a no-op",
+			provider:   func(*mockResourceRepository) ResourceRepositoryProvider { return nil },
+			wantAttach: 0,
+		},
+		{
+			name: "provider failure is wrapped",
+			provider: func(*mockResourceRepository) ResourceRepositoryProvider {
+				return &mockResourceRepositoryProviderWithError{err: fmt.Errorf("boom")}
+			},
+			wantErr: "error getting resource repository for ownership referrer",
+		},
+		{
+			name:     "identity resolution error still attaches without credentials",
+			attacher: &mockResourceRepository{identityErr: fmt.Errorf("transient")},
+			provider: func(a *mockResourceRepository) ResourceRepositoryProvider {
+				return &mockResourceRepositoryProvider{repo: a}
+			},
+			wantAttach:  1,
+			wantNilCred: true,
+		},
+		{
+			name:     "happy path attaches with the owning component version",
+			attacher: &mockResourceRepository{},
+			provider: func(a *mockResourceRepository) ResourceRepositoryProvider {
+				return &mockResourceRepositoryProvider{repo: a}
+			},
+			wantAttach:  1,
+			wantNilCred: true, // no Resolver configured => resolveCredentials yields nil
+		},
+		{
+			name:     "attach failure is wrapped",
+			attacher: &mockResourceRepository{attachErr: fmt.Errorf("push denied")},
+			provider: func(a *mockResourceRepository) ResourceRepositoryProvider {
+				return &mockResourceRepositoryProvider{repo: a}
+			},
+			wantErr: "error attaching ownership referrer for resource",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &DefaultConstructor{opts: Options{
+				ResourceRepositoryProvider: tt.provider(tt.attacher),
+			}}
+
+			err := c.attachOwnershipReferrer(context.Background(), resource, res, component, version)
+
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+
+			if tt.attacher != nil {
+				assert.Equal(t, tt.wantAttach, tt.attacher.attachCalls)
+				if tt.wantAttach > 0 {
+					assert.Equal(t, component, tt.attacher.gotComponent)
+					assert.Equal(t, version, tt.attacher.gotVersion)
+					if tt.wantNilCred {
+						assert.Nil(t, tt.attacher.gotCreds)
+					}
+				}
+			}
+		})
+	}
 }

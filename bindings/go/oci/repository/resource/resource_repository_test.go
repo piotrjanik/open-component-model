@@ -42,6 +42,74 @@ func TestProcessResourceDigest_RawAccessType(t *testing.T) {
 		"ProcessResourceDigest must convert *runtime.Raw access to typed before passing to the inner repository")
 }
 
+func TestAddOwnershipReferrer_RawAccessType(t *testing.T) {
+	// As with ProcessResourceDigest, a resource coming from a component descriptor
+	// carries *runtime.Raw access. AddOwnershipReferrer must convert it to the typed
+	// spec before handing off to the inner repository's AddOwnershipReferrer, whose
+	// type-switch only matches the typed access.
+	raw := &runtime.Raw{}
+	require.NoError(t, ociaccess.Scheme.Convert(&v1.OCIImage{
+		Type:           runtime.NewVersionedType(v1.OCIImageType, v1.Version),
+		ImageReference: "nonexistent.invalid/test:v1.0.0",
+	}, raw))
+
+	res := &descriptor.Resource{
+		ElementMeta: descriptor.ElementMeta{
+			ObjectMeta: descriptor.ObjectMeta{Name: "test", Version: "1.0.0"},
+		},
+		Type:   "ociArtifact",
+		Access: raw,
+	}
+
+	repo := NewResourceRepository(nil)
+	err := repo.AddOwnershipReferrer(t.Context(), "ocm.software/test", "1.0.0", res, nil)
+
+	// Conversion succeeded if we got past it to the inner AddOwnershipReferrer, which
+	// then fails reaching nonexistent.invalid. A conversion failure would instead say
+	// "error converting access" / "error creating new object" / "unsupported resource
+	// access type".
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "unsupported resource access type",
+		"AddOwnershipReferrer must convert *runtime.Raw access to typed before the inner repository")
+	require.NotContains(t, err.Error(), "error converting access")
+	require.NotContains(t, err.Error(), "error creating new object")
+}
+
+func TestGetOwnershipReferrer_RawAccessType(t *testing.T) {
+	// The read path mirrors AddOwnershipReferrer: a resource coming from a component
+	// descriptor carries *runtime.Raw access, and GetOwnershipReferrer must convert
+	// it to the typed spec before the inner repository resolves the image. Full
+	// referrer enumeration needs the live Referrers API and is covered by the
+	// integration suite (Test_Integration_AssetToOwner); here we only lock in the
+	// adapter's access conversion.
+	raw := &runtime.Raw{}
+	require.NoError(t, ociaccess.Scheme.Convert(&v1.OCIImage{
+		Type:           runtime.NewVersionedType(v1.OCIImageType, v1.Version),
+		ImageReference: "nonexistent.invalid/test:v1.0.0",
+	}, raw))
+
+	res := &descriptor.Resource{
+		ElementMeta: descriptor.ElementMeta{
+			ObjectMeta: descriptor.ObjectMeta{Name: "test", Version: "1.0.0"},
+		},
+		Type:   "ociArtifact",
+		Access: raw,
+	}
+
+	repo := NewResourceRepository(nil)
+	_, err := repo.GetOwnershipReferrer(t.Context(), res, nil)
+
+	// Conversion succeeded if we got past it to the resolve step, which then fails
+	// reaching nonexistent.invalid. A conversion failure would instead surface
+	// "error converting access" / "error creating new object" / "unsupported
+	// resource access type".
+	require.Error(t, err)
+	require.NotContains(t, err.Error(), "unsupported resource access type",
+		"GetOwnershipReferrer must convert *runtime.Raw access to typed before the inner repository")
+	require.NotContains(t, err.Error(), "error converting access")
+	require.NotContains(t, err.Error(), "error creating new object")
+}
+
 func TestCreateRepositoryWithFilesystemConfig(t *testing.T) {
 	r := require.New(t)
 

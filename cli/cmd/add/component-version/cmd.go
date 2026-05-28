@@ -475,6 +475,19 @@ func (c *constructorPlugin) DownloadResource(ctx context.Context, res *descripto
 	return c.plugin.DownloadResource(ctx, res, credentials)
 }
 
+// AddOwnershipReferrer implements [constructor.ResourceRepository.AddOwnershipReferrer]
+// by forwarding to the wrapped resource plugin when it implements the optional
+// [resource.OwnershipReferrerAttacher] capability (ADR 0016). Out-of-process plugins
+// that don't implement it are a no-op; in-process plugins backed by a repository that
+// does (e.g. the OCI resource repository) attach the referrer.
+func (c *constructorPlugin) AddOwnershipReferrer(ctx context.Context, component, version string, res *descriptor.Resource, credentials runtime.Typed) error {
+	attacher, ok := c.plugin.(resource.OwnershipReferrerAttacher)
+	if !ok {
+		return nil
+	}
+	return attacher.AddOwnershipReferrer(ctx, component, version, res, credentials)
+}
+
 func (prov *constructorProvider) GetTargetRepository(ctx context.Context, _ *constructorruntime.Component) (constructor.TargetRepository, error) {
 	var creds runtime.Typed
 	identity, err := prov.pluginManager.ComponentVersionRepositoryRegistry.GetComponentVersionRepositoryCredentialConsumerIdentity(ctx, prov.targetRepoSpec)

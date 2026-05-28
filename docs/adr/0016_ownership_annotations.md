@@ -304,53 +304,34 @@ If both digests match, the referrer is authentic. Unlike Option 1, the resource 
 
 #### Implementation Details
 
+The annotation keys and the artifact type `application/vnd.ocm.software.ownership.v1+json` are defined as constants in the [`spec/annotations`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/spec/annotations) package (`OwnershipComponentName`, `OwnershipComponentVersion`, `OwnershipArtifactType`, `ArtifactAnnotationKey`). The artifact type follows the [OCI artifact type convention](https://github.com/opencontainers/image-spec/blob/v1.1.0/manifest.md#guidelines-for-artifact-usage) and enables filtering via the Referrers API (`?artifactType=...`), distinguishing ownership referrers from other attached artifacts (cosign signatures, SBOMs, etc.).
+
+The referrer manifest itself is assembled once, in [`ownership_referrer.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/internal/pack/ownership_referrer.go) `OwnershipReferrer(artifact, component, version)`, which returns a `tar.ReferrersFunc`. It builds the minimal `application/vnd.ocm.software.ownership.v1+json` manifest (empty config + single empty layer, `subject` = the resource's manifest descriptor, and the three ownership annotations) and **deliberately omits `org.opencontainers.image.created`** so the manifest is content-addressed and deterministic — re-running `ocm add` converges on the same digest and the registry deduplicates it. It **skips non-OCI-manifest subjects** via `introspection.IsOCICompliantManifest`, so raw blobs get no referrer.
+
 ##### Injection Point — Creation
 
-After a resource is uploaded to the registry, push a second OCI manifest (the ownership referrer) into the **same repository**.
+A referrer is created only for **`relation: local`** resources (the resources this component version owns); `relation: external` resources and all sources never get one. There are **two creation paths**, selected by how the resource is stored:
 
-1. **[`annotations.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/spec/annotations/annotations.go)** — add constants for the ownership annotation keys and the artifact type `application/vnd.ocm.software.ownership.v1+json`. The artifact type follows the [OCI artifact type convention](https://github.com/opencontainers/image-spec/blob/v1.1.0/manifest.md#guidelines-for-artifact-usage) and enables filtering via the Referrers API (`?artifactType=...`), distinguishing ownership referrers from other attached artifacts (cosign signatures, SBOMs, etc.).
-2. **[`repository.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/repository.go) `uploadAndUpdateLocalArtifact`** — after `pack.ArtifactBlob` returns the resource descriptor (`desc`), build and push the referrer manifest. The `component` and `version` parameters are already available in this function.
-3. **Build the `application/vnd.ocm.software.ownership.v1+json` referrer manifest** — a minimal `ocispec.Manifest` with:
-   - `Subject`: descriptor of the resource (`desc.MediaType`, `desc.Digest`, `desc.Size`)
-   - `ArtifactType`: `application/vnd.ocm.software.ownership.v1+json`
-   - `Config`: `ocispec.DescriptorEmptyJSON` (standard empty `{}`)
-   - `Layers`: single `ocispec.DescriptorEmptyJSON` entry (required by the [OCI artifact guidance](https://github.com/opencontainers/image-spec/blob/v1.1.0/manifest.md#guidelines-for-artifact-usage))
-   - `Annotations`: `software.ocm.component.name`, `software.ocm.component.version`, and `software.ocm.artifact`
-4. **Push via ORAS** — marshal the manifest to JSON, compute the descriptor (`digest.FromBytes`), then call `store.Push(ctx, manifestDesc, bytes.NewReader(manifestJSON))`. The `store` is a `content.Storage` (ORAS interface) — the same store used for the resource itself. When pushing to a remote registry, ORAS automatically handles:
-   - **Referrers API (v1.1)**: the registry detects the `subject` field and indexes the referrer. The response includes the `OCI-Subject` header confirming support.
-   - **Tag fallback (v1.0)**: ORAS automatically falls back to the [referrers tag schema](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#unavailable-referrers-api) for registries that don't support the Referrers API.
+| `ocm add cv` case | Code entry point | Subject / where the referrer lands |
+| --- | --- | --- |
+| `relation: local`, **by value** (`input:` method or `access` + `copyPolicy: byValue`), packed as an OCI manifest | `AddLocalResource` → `uploadAndUpdateLocalArtifact` → `pack` | the uploaded manifest, in the **component repository** |
+| `relation: local`, **by reference** (`access.imageReference`, kept by reference) | `attachOwnershipReferrer` → `AddOwnershipReferrer` | the referenced image, in its **hosting registry** (image untouched) |
+
+**Path A — by value (referrer pushed into the component repository).** The resource blob is uploaded through [`repository.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/repository.go) `uploadAndUpdateLocalArtifact`. When the artifact is a `*descriptor.Resource` with `Relation == local`, it wires the builder in as `packOptions.Referrers = []tar.ReferrersFunc{pack.OwnershipReferrer(resource, component, version)}`. [`pack.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/internal/pack/pack.go) `ResourceLocalBlobOCILayout` forwards that to [`blob_io.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/tar/blob_io.go) `CopyOCILayoutWithIndex`, which pushes the referrer **as an additional `CopyGraph` root** alongside the resource. Note: this only applies to the **OCI-layout** pack path — a resource whose blob is a single OCI **layer** (a plain `file`/`dir` input) goes through `ResourceLocalBlobOCILayer`, has no manifest subject, and gets no referrer.
+
+**Path B — by reference (referrer pushed into the image's own registry).** A `relation: local` resource kept by reference is never re-uploaded, so the referrer is attached next to the existing image. [`construct.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/constructor/construct.go) `processResource` calls `attachOwnershipReferrer` (only for `relation: local`), which resolves credentials and invokes `ResourceRepository.AddOwnershipReferrer`. This is an **optional capability**: a resource repository advertises it via [`OwnershipReferrerAttacher`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/plugin/manager/registries/resource/contract.go); repositories that cannot host referrers (classic Helm HTTP repos, out-of-process plugins) are a no-op. For OCI, `oci.Repository.AddOwnershipReferrer` resolves the referenced image in its hosting registry (`StoreForReference(imageReference)` + `Resolve(tag)`), builds the referrer against that subject, and `Push`es it into the **same registry as the image**. The image bytes are unchanged, so OCI-level signatures stay valid.
+
+In both paths the referrer manifest carries a `subject`, so when pushing to a remote registry ORAS automatically uses the **Referrers API (v1.1)** — or transparently falls back to the [referrers tag schema](https://github.com/opencontainers/distribution-spec/blob/v1.1.1/spec.md#unavailable-referrers-api) on pre-v1.1 registries (see "Fallback Compatibility" below).
 
 ##### Injection Point — Transfer
 
-`ocm transfer` currently does **not** copy ownership referrers. The transfer graph is built in [`graph.go`](https://github.com/open-component-model/open-component-model/blob/main/cli/cmd/transfer/component-version/internal/graph.go) `fillGraphDefinitionWithPrefetchedComponents`, which processes resources via `processLocalBlob` / `processOCIArtifact` but has no referrer discovery step.
+`ocm transfer` **copies** ownership referrers to the target. The transfer graph in [`localblob.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/transfer/internal/localblob.go) `processLocalBlob` chains a `GetLocalResource` (source) into an `AddLocalResource` (target) per resource; the referrer rides along **inside the OCI layout** that flows between the two steps. No separate discovery step in the graph is needed.
 
-Two strategies to handle referrers during transfer:
+- **Source — discover and pack into the layout.** [`repository.go`](https://github.com/open-component-model/open-component-model/blob/main/bindings/go/oci/repository.go) `GetLocalResource` → `getLocalBlobFromIndexOrManifest` calls `lookupOwnershipReferrers`, which lists referrers via the live Referrers API (`registry.Referrers(..., OwnershipArtifactType)`) and passes them to `tar.CopyToOCILayoutInMemory(Referrers: ...)`. The resource **and its ownership referrer** are written into the layout tarball. A referrers-query failure is non-fatal — the read continues without them.
+- **Target — copy, don't re-create.** `AddLocalResource` → `uploadAndUpdateLocalArtifact` sets `packOptions.CopySourceReferrerArtifactType = OwnershipArtifactType` for every resource. In `CopyOCILayoutWithIndex`, an inbound referrer of that type found in the layout index **replaces creation**: `existingReferrers` wraps it as the `ReferrersFunc`, so it is carried over verbatim (instead of a new one being created) and copied as its own root via `tar.CopyReferrerRoots` — created and copied referrers share one path.
+- **OCI-image-by-reference transfer.** When a resource is transferred as an OCI image (`UploadResource` → `uploadOCIImage`), referrers that travelled inside the layout are held aside by `partitionOwnershipReferrers` (so the main artifact is still selected correctly) and copied with `uploadOwnershipReferrers` — only for `relation: local`.
 
-1. **Re-create on upload** — if the target repository's `uploadAndUpdateLocalArtifact` pushes a fresh referrer (as described above), then any resource that goes through the full upload path will automatically get a referrer in the target. This is the simplest approach.
-2. **Discover and copy** — for resources copied without re-uploading (e.g. blob-level copy or OCI layout transfer), the referrer must be explicitly transferred. Use `registry.Referrers()` to discover ownership referrers, then copy them:
-
-```go
-// Discover ownership referrers for a resource descriptor
-const ownershipArtifactType = "application/vnd.ocm.software.ownership.v1+json"
-
-referrers, err := registry.Referrers(ctx, sourceStore, resourceDesc, ownershipArtifactType)
-if err != nil {
-    return fmt.Errorf("failed to discover ownership referrers: %w", err)
-}
-
-// Copy each referrer manifest to the target
-for _, ref := range referrers {
-    rc, err := sourceStore.Fetch(ctx, ref)
-    if err != nil {
-        return fmt.Errorf("failed to fetch referrer %s: %w", ref.Digest, err)
-    }
-    defer rc.Close()
-
-    if err := targetStore.Push(ctx, ref, rc); err != nil {
-        return fmt.Errorf("failed to push referrer %s: %w", ref.Digest, err)
-    }
-}
-```
+**Create and copy are mutually exclusive — this matters.** A freshly created referrer and a copied one share the same subject *digest* but can differ in the subject descriptor's serialized form — notably the `org.opencontainers.image.ref.name` annotation the layout writer stamps onto the re-materialized top-level manifest. Pushing both would leave **two** referrer manifests on one subject. Suppressing creation whenever an inbound referrer is present keeps it to exactly one: `ocm add` creates, `ocm transfer` copies.
 
 #### Consuming Ownership Referrers from External Tools
 

@@ -167,6 +167,11 @@ type ResourceRepository interface {
 	ResourceConsumerIdentityProvider
 	// DownloadResource downloads a resource from the repository.
 	DownloadResource(ctx context.Context, res *descriptor.Resource, credentials runtime.Typed) (content blob.ReadOnlyBlob, err error)
+	// AddOwnershipReferrer attaches an asset-to-owner ownership referrer (ADR 0016)
+	// linking res back to the owning component version in the registry that hosts it.
+	// The constructor invokes it for relation=local resources kept by reference.
+	// Repositories that cannot host ownership referrers implement this as a no-op.
+	AddOwnershipReferrer(ctx context.Context, component, version string, res *descriptor.Resource, credentials runtime.Typed) error
 }
 
 type ResourceRepositoryProvider interface {

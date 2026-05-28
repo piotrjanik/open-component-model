@@ -430,6 +430,15 @@ func (c *DefaultConstructor) processResource(ctx context.Context, targetRepo Tar
 					}
 				}
 			}
+
+			// A relation=local resource kept by reference still belongs to this
+			// component version; attach an ownership referrer (ADR 0016) in the
+			// hosting registry when the resource repository supports it.
+			if resource.Relation == constructor.LocalRelation {
+				if err = c.attachOwnershipReferrer(ctx, resource, res, component, version); err != nil {
+					return nil, err
+				}
+			}
 		}
 	default:
 		return nil, fmt.Errorf("resource %q has no access type and no input method", resource.ToIdentity())
@@ -470,6 +479,42 @@ func (c *DefaultConstructor) processResourceByValue(ctx context.Context, targetR
 		return nil, fmt.Errorf("error downloading resource: %w", err)
 	}
 	return addColocatedResourceLocalBlob(ctx, targetRepo, component, version, resource, data)
+}
+
+// attachOwnershipReferrer attaches an asset-to-owner ownership referrer (ADR
+// 0016) for a relation=local resource that is kept by reference. It is a no-op
+// when no resource repository provider is configured; repositories that cannot
+// host referrers implement [ResourceRepository.AddOwnershipReferrer] as a no-op.
+func (c *DefaultConstructor) attachOwnershipReferrer(ctx context.Context, resource *constructor.Resource, res *descriptor.Resource, component, version string) error {
+	logger := log.Base().With("component", component, "version", version, "resource", resource.ToIdentity())
+
+	if c.opts.ResourceRepositoryProvider == nil {
+		logger.Debug("no resource repository provider configured, skipping ownership referrer")
+		return nil
+	}
+
+	repo, err := c.opts.GetResourceRepository(ctx, resource)
+	if err != nil {
+		return fmt.Errorf("error getting resource repository for ownership referrer of %q: %w", resource.ToIdentity(), err)
+	}
+
+	// best effort to resolve credentials for the hosting registry; if no
+	// identity is resolved, attachment proceeds without credentials.
+	var creds ocmruntime.Typed
+	if identity, err := repo.GetResourceCredentialConsumerIdentity(ctx, resource); err != nil {
+		// Not just "no identity": a transient or config error lands here too, so
+		// log it rather than dropping it silently — otherwise it resurfaces later
+		// as a confusing auth failure with no breadcrumb.
+		logger.Debug("could not resolve credential consumer identity for ownership referrer; proceeding without credentials", "error", err)
+	} else if creds, err = resolveCredentials(ctx, c.opts.Resolver, identity); err != nil {
+		return fmt.Errorf("error resolving credentials for ownership referrer of %q: %w", resource.ToIdentity(), err)
+	}
+
+	if err := repo.AddOwnershipReferrer(ctx, component, version, res, creds); err != nil {
+		return fmt.Errorf("error attaching ownership referrer for resource %q: %w", resource.ToIdentity(), err)
+	}
+	logger.Debug("ownership referrer attached")
+	return nil
 }
 
 func (c *DefaultConstructor) processSource(ctx context.Context, targetRepo TargetRepository, src *constructor.Source, component, version string) (*descriptor.Source, error) {
@@ -711,7 +756,7 @@ func addColocatedResourceLocalBlob(
 
 	uploaded, err := repo.AddLocalResource(ctx, component, version, descResource, data)
 	if err != nil {
-		return nil, fmt.Errorf("error adding local resource %q based on input type %q as local resource to component %q : %w", resource.ToIdentity(), resource.Input.GetType(), component, err)
+		return nil, fmt.Errorf("error adding colocated local resource %q to component %q: %w", resource.ToIdentity(), component, err)
 	}
 
 	return uploaded, nil
