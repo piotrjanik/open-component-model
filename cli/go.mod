@@ -147,3 +147,16 @@ require (
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.0 // indirect
 )
+
+// ADR 0016 ownership referrers span several in-tree bindings modules that are
+// consumed here before being released: the constructor interface gains
+// AddOwnershipReferrer and drives the by-reference attach, the plugin module
+// exposes the OwnershipReferrerAttacher capability, and the oci module backs it
+// (which in turn needs the new repository symbols). Build them from source until
+// they are published and these requires are bumped, then drop these replaces.
+replace (
+	ocm.software/open-component-model/bindings/go/constructor => ../bindings/go/constructor
+	ocm.software/open-component-model/bindings/go/oci => ../bindings/go/oci
+	ocm.software/open-component-model/bindings/go/plugin => ../bindings/go/plugin
+	ocm.software/open-component-model/bindings/go/repository => ../bindings/go/repository
+)

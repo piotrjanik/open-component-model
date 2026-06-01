@@ -35,3 +35,9 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	ocm.software/open-component-model/bindings/go/dag v0.0.6 // indirect
 )
+
+// ADR 0016 ownership referrers add new symbols (repository.OwnershipReferrer,
+// OwnershipReferrerRepository) to the repository module that are consumed here
+// before they are released. Build against the in-tree repository module until it
+// is published and this require is bumped, then drop this replace.
+replace ocm.software/open-component-model/bindings/go/repository => ../repository

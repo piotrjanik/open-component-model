@@ -4,6 +4,17 @@ go 1.26.3
 
 replace ocm.software/open-component-model/cli => ../
 
+// The in-tree cli module above consumes unreleased ADR 0016 ownership-referrer
+// symbols from these bindings modules; replace directives are not transitive, so
+// mirror cli's replaces here. Drop once the modules are published and the requires
+// are bumped.
+replace (
+	ocm.software/open-component-model/bindings/go/constructor => ../../bindings/go/constructor
+	ocm.software/open-component-model/bindings/go/oci => ../../bindings/go/oci
+	ocm.software/open-component-model/bindings/go/plugin => ../../bindings/go/plugin
+	ocm.software/open-component-model/bindings/go/repository => ../../bindings/go/repository
+)
+
 require (
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1

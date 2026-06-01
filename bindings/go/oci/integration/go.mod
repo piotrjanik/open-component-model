@@ -26,6 +26,11 @@ require (
 // It is irrelevant for us that integration tests cannot be consumed by other modules.
 replace ocm.software/open-component-model/bindings/go/oci => ../
 
+// The in-tree oci module above consumes unreleased ADR 0016 ownership-referrer
+// symbols from the repository module, so build that from source too. Drop once
+// repository is published and oci's require is bumped.
+replace ocm.software/open-component-model/bindings/go/repository => ../../repository
+
 require (
 	dario.cat/mergo v1.0.2 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
