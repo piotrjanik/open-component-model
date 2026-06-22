@@ -24,6 +24,11 @@ vars:
     sh: 'source {{.PROJECT_ROOT}}/.env && [ -f .env ] && source .env; echo "${YQ_VERSION:-v4.49.2}"'
 
   CONTAINER_TOOL: '{{.CONTAINER_TOOL | default "docker"}}'
+  # OCM component coordinates for the controller component version (bundles the
+  # controller OCI image and the Helm chart). See generate/component-constructor.
+  PROVIDER: ocm.software
+  NAME: ocm-k8s-toolkit
+  COMPONENT_CONSTRUCTOR_FILE: '{{.TASKFILE_DIR}}/tmp/component-constructor.yaml'
   LOCALBIN: '{{.TASKFILE_DIR}}/bin'
   KUBECTL: '{{.KUBECTL | default "kubectl"}}'
   CONTROLLER_GEN: '{{.LOCALBIN}}/controller-gen-{{.CONTROLLER_TOOLS_VERSION}}'
@@ -158,6 +163,75 @@ tasks:
     cmds:
       - mkdir -p "{{.OUTPUT_DIR}}"
       - tar -xf "{{.TAR_PATH}}" -C "{{.OUTPUT_DIR}}"
+
+  # OCM component packaging (mirrors cli:generate/component-constructor + cli:generate/ctf)
+  generate/component-constructor:
+    desc: "Build the controller image + chart and generate the component-constructor.yaml"
+    summary: |
+      Builds the multi-arch controller image and packages the Helm chart, then
+      writes a self-contained component bundle under tmp/ for the
+      ocm.software/ocm-k8s-toolkit component. Resource input paths are relative
+      to the bundle (tmp/) directory.
+    requires:
+      vars: [VERSION]
+    cmds:
+      - task: docker-build/multi-arch
+        vars:
+          PLATFORMS: 'linux/amd64,linux/arm64'
+          CONTROLLER_IMG: '{{.PROVIDER}}/{{.NAME}}:{{.VERSION}}'
+          OCI_OUTPUT: '{{.TASKFILE_DIR}}/tmp/oci/controller.tar'
+      - task: helm/package
+        vars:
+          VERSION: '{{.VERSION}}'
+          APP_VERSION: '{{.VERSION}}'
+      - mkdir -p tmp/chart
+      - cp dist/chart-{{.VERSION}}.tgz tmp/chart/chart-{{.VERSION}}.tgz
+      - |
+        cat > {{.COMPONENT_CONSTRUCTOR_FILE}} <<EOF
+        name: {{.PROVIDER}}/{{.NAME}}
+        version: {{.VERSION}}
+        provider:
+          name: {{.PROVIDER}}
+        resources:
+          - name: controller
+            type: ociImage
+            version: {{.VERSION}}
+            relation: local
+            input:
+              type: file
+              mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+              path: oci/controller.tar
+          - name: chart
+            type: helmChart
+            version: {{.VERSION}}
+            relation: local
+            input:
+              type: helm
+              path: chart/chart-{{.VERSION}}.tgz
+        EOF
+      - cat {{.COMPONENT_CONSTRUCTOR_FILE}}
+
+  generate/ctf:
+    desc: "Build the ocm.software/ocm-k8s-toolkit component version into a local CTF (requires the repo CLI: task cli:build)"
+    summary: |
+      Controller counterpart of cli:generate/ctf. Builds the component bundle and
+      adds the component version to a local transport archive using the repo's
+      OCM CLI. Override OCM (path to the ocm binary) and CTF_LOCATION as needed.
+    requires:
+      vars: [VERSION]
+    vars:
+      OCM: '{{.OCM | default (printf "%s/../../cli/tmp/bin/ocm" .TASKFILE_DIR)}}'
+      CTF_LOCATION: '{{.CTF_LOCATION | default (printf "%s/tmp/transport-archive" .TASKFILE_DIR)}}'
+    cmds:
+      - task: generate/component-constructor
+        vars:
+          VERSION: '{{.VERSION}}'
+      # CWD is the bundle dir so both file and helm inputs resolve.
+      - |
+        rm -rf '{{.CTF_LOCATION}}'
+        cd '{{.TASKFILE_DIR}}/tmp' && '{{.OCM}}' add component-versions \
+          --constructor component-constructor.yaml \
+          --repository '{{.CTF_LOCATION}}'
 
   # Helm chart tasks
   helm/generate-crds:

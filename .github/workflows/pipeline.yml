@@ -132,6 +132,7 @@ jobs:
     outputs:
       publish: ${{ steps.check.outputs.publish }}
       ref: ${{ steps.check.outputs.ref }}
+      owner: ${{ steps.check.outputs.owner }}
     steps:
       - name: Decide
         id: check
@@ -142,6 +143,8 @@ jobs:
           script: |
             const ref = process.env.INPUT_REF || process.env.GITHUB_HEAD_REF || process.env.GITHUB_REF_NAME;
             core.setOutput('ref', ref);
+            // Lowercased owner for constructing GHCR refs (GHCR rejects uppercase).
+            core.setOutput('owner', (context.repo.owner || '').toLowerCase());
             if (context.eventName === 'pull_request') {
               core.setOutput('publish', 'false');
               return;
@@ -355,4 +358,116 @@ jobs:
           retention-days: 1
           path: ${{ env.LOCATION }}/dist/chart-*.tgz
           if-no-files-found: error
+  # === end ===
+
+  # === New: build the ocm.software/ocm component graph (umbrella + cli +
+  # controller sub-components) into a self-contained CTF, store it as an
+  # artifact, and promote it to GHCR via `ocm transfer` once the app is
+  # published. The CLI and controller ship in lockstep at the same version. ===
+
+  # Assemble a CTF from the already-built CLI/controller image tars, CLI
+  # binaries and Helm chart (their build artifacts) plus the constructor
+  # template - no rebuild. Gated behind the same publish decision as the
+  # image/chart pushes.
+  assemble_component:
+    name: Assemble OCM Component
+    needs: [build_cli, build_controller, decide_publish]
+    if: ${{ needs.decide_publish.outputs.publish == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      actions: read
+    env:
+      CLI_VERSION: ${{ needs.build_cli.outputs.version }}
+      CONTROLLER_VERSION: ${{ needs.build_controller.outputs.version }}
+    steps:
+      - name: Checkout constructor template
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          sparse-checkout: .github/config
+          persist-credentials: 'false'
+
+      # Lands as component/cli/bin/ocm-<os>-<arch> and component/cli/oci/cli.tar.
+      - name: Download CLI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.build_cli.outputs.artifact_name }}
+          path: component/cli
+
+      # Lands as component/controller/controller.tar.
+      - name: Download controller artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: ${{ needs.build_controller.outputs.artifact_name }}
+          path: component/controller
+
+      # Lands as component/controller/chart-<version>.tgz.
+      - name: Download controller chart artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: controller-chart-pr
+          path: component/controller
+
+      - name: Build component CTF
+        env:
+          VERSION: ${{ needs.build_cli.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # The CLI and controller are released in lockstep at one version; a
+          # mismatch means we must not bundle them into one component graph.
+          if [ "${CLI_VERSION}" != "${CONTROLLER_VERSION}" ]; then
+            echo "::error::CLI (${CLI_VERSION}) and controller (${CONTROLLER_VERSION}) versions differ; cannot bundle into one component version"
+            exit 1
+          fi
+
+          # Substitute the version into the constructor template.
+          sed "s/((VERSION))/${VERSION}/g" .github/config/ocm-component-constructor.yaml > component/component-constructor.yaml
+
+          echo "Generated constructor:"
+          cat component/component-constructor.yaml
+          echo "Bundle contents:"
+          find component -type f | sort
+
+          # Dogfood the just-built CLI (this runner is arm64) to add all three
+          # component versions into one CTF in a single pass; intra-file
+          # componentReferences resolve within the archive. Resource input paths
+          # are relative to the bundle dir, so run from there.
+          OCM="${GITHUB_WORKSPACE}/component/cli/bin/ocm-linux-arm64"
+          chmod +x "${OCM}"
+          ( cd component && "${OCM}" add component-versions \
+              --constructor component-constructor.yaml \
+              --repository "${GITHUB_WORKSPACE}/ctf" )
+
+          echo "Umbrella component version:"
+          "${OCM}" get cv "ctf::${GITHUB_WORKSPACE}/ctf//ocm.software/ocm:${VERSION}"
+
+      # The CTF is self-contained (resource blobs were imported on add), so the
+      # archive directory is the only thing the promotion step needs.
+      - name: Upload component CTF
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          if-no-files-found: error
+          retention-days: 1
+          name: ocm-component
+          path: ctf
+
+  # Promote the assembled CTF to GHCR with `ocm transfer`, using the
+  # just-published CLI image as the OCM client (dogfooding). Ordered after the
+  # image/chart pushes so the component graph is only published once its
+  # underlying images are.
+  publish_component:
+    name: Publish OCM Component
+    needs: [assemble_component, build_cli, publish_cli, publish_controller, decide_publish]
+    if: ${{ needs.decide_publish.outputs.publish == 'true' }}
+    permissions:
+      contents: read
+      packages: write
+      actions: read
+    uses: ./.github/workflows/publish-ocm-component-version.yml
+    with:
+      component_artifact_name: ocm-component
+      component_reference: ocm.software/ocm:${{ needs.build_cli.outputs.version }}
+      ocm_repository: ghcr.io/${{ needs.decide_publish.outputs.owner }}
+      cli_image: ghcr.io/${{ needs.decide_publish.outputs.owner }}/cli:${{ needs.build_cli.outputs.version }}
   # === end ===

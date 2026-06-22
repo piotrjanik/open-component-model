@@ -1,0 +1,145 @@
+# Constructor template for the OCM component graph published as ocm.software/ocm.
+#
+# The CLI and controller ship in lockstep at the same version. This builds a
+# hierarchical graph: an umbrella ocm.software/ocm component that references two
+# independently-addressable sub-components, ocm.software/cli and
+# ocm.software/ocm-k8s-toolkit. Adding all three in one `ocm add
+# component-versions` pass resolves the intra-file componentReferences, and a
+# single recursive `ocm transfer` promotes the whole graph to GHCR.
+#
+# ((VERSION)) is substituted at publish time (see pipeline.yml::assemble_component).
+# Resource input paths are relative to the bundle directory the CLI runs in:
+#
+#   component/                          <- working directory for `ocm add`
+#     component-constructor.yaml
+#     cli/bin/ocm-<os>-<arch>           (from the CLI build artifact)
+#     cli/oci/cli.tar                   (from the CLI build artifact)
+#     controller/controller.tar         (from the controller build artifact)
+#     controller/chart-<version>.tgz    (from the controller-chart build artifact)
+#
+# The CLI sub-component mirrors cli:generate/component-constructor: one
+# executable resource per build target plus the multi-arch container image. Keep
+# the target matrix below in sync with cli/Taskfile.yml (build/multiarch).
+components:
+  - name: ocm.software/cli
+    version: ((VERSION))
+    provider:
+      name: ocm.software
+    resources:
+      - name: cli
+        type: executable
+        version: ((VERSION))
+        labels:
+          - name: downloadName
+            value: ocm
+        extraIdentity:
+          os: windows
+          architecture: amd64
+        relation: local
+        input:
+          type: file
+          path: cli/bin/ocm-windows-amd64
+      - name: cli
+        type: executable
+        version: ((VERSION))
+        labels:
+          - name: downloadName
+            value: ocm
+        extraIdentity:
+          os: windows
+          architecture: arm64
+        relation: local
+        input:
+          type: file
+          path: cli/bin/ocm-windows-arm64
+      - name: cli
+        type: executable
+        version: ((VERSION))
+        labels:
+          - name: downloadName
+            value: ocm
+        extraIdentity:
+          os: linux
+          architecture: amd64
+        relation: local
+        input:
+          type: file
+          path: cli/bin/ocm-linux-amd64
+      - name: cli
+        type: executable
+        version: ((VERSION))
+        labels:
+          - name: downloadName
+            value: ocm
+        extraIdentity:
+          os: linux
+          architecture: arm64
+        relation: local
+        input:
+          type: file
+          path: cli/bin/ocm-linux-arm64
+      - name: cli
+        type: executable
+        version: ((VERSION))
+        labels:
+          - name: downloadName
+            value: ocm
+        extraIdentity:
+          os: darwin
+          architecture: amd64
+        relation: local
+        input:
+          type: file
+          path: cli/bin/ocm-darwin-amd64
+      - name: cli
+        type: executable
+        version: ((VERSION))
+        labels:
+          - name: downloadName
+            value: ocm
+        extraIdentity:
+          os: darwin
+          architecture: arm64
+        relation: local
+        input:
+          type: file
+          path: cli/bin/ocm-darwin-arm64
+      - name: image
+        type: ociImage
+        version: ((VERSION))
+        relation: local
+        input:
+          type: file
+          mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+          path: cli/oci/cli.tar
+  - name: ocm.software/ocm-k8s-toolkit
+    version: ((VERSION))
+    provider:
+      name: ocm.software
+    resources:
+      - name: controller
+        type: ociImage
+        version: ((VERSION))
+        relation: local
+        input:
+          type: file
+          mediaType: application/vnd.ocm.software.oci.layout.v1+tar
+          path: controller/controller.tar
+      - name: chart
+        type: helmChart
+        version: ((VERSION))
+        relation: local
+        input:
+          type: helm
+          path: controller/chart-((VERSION)).tgz
+  - name: ocm.software/ocm
+    version: ((VERSION))
+    provider:
+      name: ocm.software
+    componentReferences:
+      - name: cli
+        componentName: ocm.software/cli
+        version: ((VERSION))
+      - name: controller
+        componentName: ocm.software/ocm-k8s-toolkit
+        version: ((VERSION))

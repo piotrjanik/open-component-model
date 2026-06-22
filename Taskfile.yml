@@ -203,3 +203,54 @@ tasks:
           CLI_DOCUMENTATION_MODE: "hugo"
           CLI_DOCUMENTATION_DIRECTORY: '{{ .ROOT_DIR }}/cli/docs/reference'
       - task: 'tidy'
+
+  component/ctf:
+    desc: "Build the aggregate ocm.software/ocm component version (references the cli and controller components) into a CTF"
+    summary: |
+      Builds the cli and controller component versions and an aggregate
+      ocm.software/ocm component that references them via componentReferences,
+      all into one self-contained CTF (the references resolve within the archive).
+
+      Mirrors the per-component tasks: cli:generate/ctf and
+      kubernetes/controller:generate/ctf. Override VERSION (default 0.0.0-dev)
+      and REPOSITORY to use a remote OCM repository instead of the local CTF:
+        task component/ctf VERSION=0.1.0 REPOSITORY=ghcr.io/<your-org>
+    vars:
+      VERSION: '{{ .VERSION | default "0.0.0-dev" }}'
+      REPOSITORY: '{{ .REPOSITORY | default (printf "%s/tmp/ocm-ctf" .ROOT_DIR) }}'
+      OCM: '{{ .ROOT_DIR }}/cli/tmp/bin/ocm'
+      OCM_CONSTRUCTOR: '{{ .ROOT_DIR }}/tmp/ocm-component-constructor.yaml'
+    cmds:
+      # Build the cli and controller component bundles (+ the host CLI used to add).
+      - task: 'cli:generate/component-constructor'
+        vars:
+          VERSION: '{{ .VERSION }}'
+      - task: 'cli:build'
+      - task: 'kubernetes/controller:generate/component-constructor'
+        vars:
+          VERSION: '{{ .VERSION }}'
+      # Generate the aggregate constructor that references the two sub-components.
+      - |
+        mkdir -p '{{ .ROOT_DIR }}/tmp'
+        cat > '{{ .OCM_CONSTRUCTOR }}' <<EOF
+        name: ocm.software/ocm
+        version: {{ .VERSION }}
+        provider:
+          name: ocm.software
+        componentReferences:
+          - name: cli
+            componentName: ocm.software/cli
+            version: {{ .VERSION }}
+          - name: controller
+            componentName: ocm.software/ocm-k8s-toolkit
+            version: {{ .VERSION }}
+        EOF
+        cat '{{ .OCM_CONSTRUCTOR }}'
+      # Add all three components into one repository. The cli and controller
+      # components are added first (each from its own bundle dir so resource
+      # input paths resolve), then the aggregate that references them.
+      - rm -rf '{{ .REPOSITORY }}'
+      - cd '{{ .ROOT_DIR }}/cli/tmp' && '{{ .OCM }}' add component-versions --constructor component-constructor.yaml --repository '{{ .REPOSITORY }}'
+      - cd '{{ .ROOT_DIR }}/kubernetes/controller/tmp' && '{{ .OCM }}' add component-versions --constructor component-constructor.yaml --repository '{{ .REPOSITORY }}'
+      - "'{{ .OCM }}' add component-versions --constructor '{{ .OCM_CONSTRUCTOR }}' --repository '{{ .REPOSITORY }}'"
+      - "'{{ .OCM }}' get cv '{{ .REPOSITORY }}//ocm.software/ocm:{{ .VERSION }}'"
