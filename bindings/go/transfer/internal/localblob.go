@@ -127,7 +127,9 @@ func processLocalBlob(resource descriptorv2.Resource, _ *descriptorv2.LocalBlob,
 // (OCI registry or CTF) via chooseAddLocalResourceType.
 // It uses the output of the preceding Get transformation to populate the fields of the
 // AddLocalResource transformation, ensuring that the same resource is referenced and uploaded.
-func uploadAsLocalResource(toSpec runtime.Typed, component, version, addResourceID, getResourceID string, referenceName referenceNameOption) (transformv1alpha1.GenericTransformation, error) {
+// outputFileField names the Get transformation's output field holding the buffered blob file
+// (usually "file"; the GitHub get transformation exposes it as "contentFile").
+func uploadAsLocalResource(toSpec runtime.Typed, component, version, addResourceID, getResourceID string, referenceName referenceNameOption, outputFileField string) (transformv1alpha1.GenericTransformation, error) {
 	addLocalResourceType, err := chooseAddLocalResourceType(toSpec)
 	if err != nil {
 		return transformv1alpha1.GenericTransformation{}, fmt.Errorf("choosing add local resource type for target repository: %w", err)
@@ -161,7 +163,7 @@ func uploadAsLocalResource(toSpec runtime.Typed, component, version, addResource
 				"extraIdentity": fmt.Sprintf("${has(%s.output.resource.extraIdentity) ? %s.output.resource.extraIdentity  : {}}", getResourceID, getResourceID),
 				"srcRefs":       fmt.Sprintf("${has(%s.output.resource.srcRefs) ? %s.output.resource.srcRefs  : []}", getResourceID, getResourceID),
 			},
-			"file": fmt.Sprintf("${%s.output.file}", getResourceID),
+			"file": fmt.Sprintf("${%s.output.%s}", getResourceID, outputFileField),
 		}},
 	}
 	return addResourceTransform, nil
